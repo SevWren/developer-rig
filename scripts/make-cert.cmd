@@ -4,27 +4,12 @@ SETLOCAL
 REM https://stackoverflow.com/questions/10175812/how-to-create-a-self-signed-certificate-with-openssl
 REM https://stackoverflow.com/questions/2129713
 
-REM Determine if this script needs to run.
-powershell -Command "& {Get-ChildItem -Path Cert:\LocalMachine\Root}" | FIND "Twitch Developer Rig CA" > NUL
-IF NOT ERRORLEVEL 1 EXIT /B 0
-
-REM Configure path to OpenSSL.
-openssl version 2> NUL > NUL
-IF ERRORLEVEL 1 PATH %PATH%;%ProgramFiles%\Git\mingw64\bin
-openssl version 2> NUL > NUL
-IF ERRORLEVEL 1 (
-	ECHO Cannot configure path to OpenSSL.
-	EXIT /B 1
-)
-
 REM Create the temporary directory.
-SET D=%~dp0
 SET T=%TEMP%\mkc%RANDOM%
 MD "%T%"
-CD /D %T%
 
 REM Check for elevation.
-net file > NUL 2> NUL
+CALL "%~dp0check-make-cert.cmd"
 IF ERRORLEVEL 1 (
 	REM Continue installation in an elevated command prompt.
 	ECHO CreateObject^("Shell.Application"^).ShellExecute "cmd.exe", "/c " ^& WScript.Arguments^(0^), "", "runas" > "%T%\elevate.vbs"
@@ -37,10 +22,87 @@ IF ERRORLEVEL 1 (
 	SET PAUSE=
 )
 
+REM Switch to the temporary directory.
+SET D=%~dp0
+CD /D %T%
+
+REM Determine if openssl needs to run to create the certificates.
+SET NEEDS_INSTALLATION=YES
+SET SSL=%D%..\ssl
+SET HAS_ALL_FILES=NO
+IF EXIST "%SSL%\cacert.crt" IF EXIST "%SSL%\cacert.key" (
+	IF EXIST "%SSL%\selfsigned.crt" IF EXIST "%SSL%\selfsigned.key" (
+		IF EXIST "%SSL%\server.crt" IF EXIST "%SSL%\server.key" SET HAS_ALL_FILES=YES
+	)
+)
+IF "%HAS_ALL_FILES%" == "YES" (
+	REM The certificates have been previously created.  Determine if the CA certificate needs installation.
+	powershell -Command "& {Get-ChildItem -Path Cert:\LocalMachine\Root}" | FIND "Twitch Developer Rig CA" > NUL
+	IF NOT ERRORLEVEL 1 SET NEEDS_INSTALLATION=NO
+) ELSE (
+	REM Create the certificates.
+	CALL :create
+	IF ERRORLEVEL 1 EXIT /B
+)
+
+REM Copy localhost certificates to the extension conf directory.
+SET CONF=%D%..\..\my-extension\conf
+IF NOT EXIST "%CONF%" MD "%CONF%"
+COPY /Y "%SSL%\server.*" "%CONF%" > NUL
+IF ERRORLEVEL 1 (
+	ECHO Cannot place the extension server certificates.
+	GOTO done
+)
+
+REM Import the CA certificate into the local machine's root certificate store.
+SET FF=%ProgramFiles%\Mozilla Firefox\defaults\pref
+IF "%NEEDS_INSTALLATION%" == "YES" (
+	ECHO Import-Certificate -Filepath "%SSL%\cacert.crt" -CertStoreLocation Cert:\LocalMachine\Root > import.ps1
+	powershell -File import.ps1
+	IF ERRORLEVEL 1 (
+		ECHO Cannot import the CA certificate into the local machine's root certificate store.
+		GOTO done
+	)
+
+	REM If Firefox is installed, allow it to use the certificates in the local machine's root certificate store.
+	IF EXIST "%FF%" (
+		ECHO pref^("security.enterprise_roots.enabled", true^); > "%FF%\twitch-developer-rig.js"
+	)
+
+	REM The user must restart their browser for these changes to take effect.
+	IF "%~1" == "" (
+		ECHO NOTE:  you must restart your browser before running the developer rig.
+	) ELSE (
+		ECHO NOTE:  you must restart your browser before continuing.
+	)
+	SET PAUSE=PAUSE
+)
+
+:done
+SET EXIT_CODE=%ERRORLEVEL%
+CD /D %D%
+RD /Q /S "%T%"
+%PAUSE%
+EXIT /B %EXIT_CODE%
+
+:create
+REM Configure path to OpenSSL.
+openssl version 2> NUL > NUL
+IF ERRORLEVEL 1 PATH %PATH%;%ProgramFiles%\Git\mingw64\bin
+openssl version 2> NUL > NUL
+IF ERRORLEVEL 1 (
+	ECHO Cannot configure path to OpenSSL.
+	EXIT /B 1
+)
+
 REM Prepare input files.
 COPY "%D%*.cnf" > NUL
 COPY /B NUL index.txt > NUL
 openssl rand -hex 4 > serial.txt
+IF ERRORLEVEL 1 (
+	ECHO Cannot create certificate serial number.
+	EXIT /B 1
+)
 FOR /L %%I IN (1,1,7) DO ECHO.>> enters.txt
 FOR /L %%I IN (1,1,2) DO ECHO y>> yes.txt
 SET CA=openssl-ca.cnf
@@ -49,7 +111,7 @@ REM Create the certificate authority certificate.
 openssl req -x509 -days 99999 -config %CA% -newkey rsa:4096 -sha256 -nodes -out cacert.pem -outform PEM < enters.txt
 IF ERRORLEVEL 1 (
 	ECHO Cannot create the certificate authority certificate.
-	GOTO done
+	EXIT /B 1
 )
 
 REM Create the certificate requests for the rig and localhost.
@@ -61,7 +123,7 @@ FOR %%I IN (rig localhost) DO (
 	openssl req -config openssl-server.cnf -newkey rsa:2048 -sha256 -nodes -out %%Icert.csr -outform PEM < enters.txt
 	IF ERRORLEVEL 1 (
 		ECHO Cannot create the %%I certificate request.
-		GOTO done
+		EXIT /B 1
 	)
 	REN serverkey.pem %%Ikey.pem
 )
@@ -74,39 +136,18 @@ FOR %%I IN (rig localhost) DO (
 	openssl ca -config %CA% -policy signing_policy -extensions signing_req -out %%Icert.pem -infiles %%Icert.csr < yes.txt
 	IF ERRORLEVEL 1 (
 		ECHO Cannot create the %%I server certificate.
-		GOTO done
+		EXIT /B 1
 	)
 )
 
-REM Move all desired files to the rig ssl and extension conf directories.
-MOVE /Y cacert.pem "%D%..\ssl\cacert.crt" > NUL
-MOVE /Y cakey.pem "%D%..\ssl\cacert.key" > NUL
-MOVE /Y rigcert.pem "%D%..\ssl\selfsigned.crt" > NUL
-MOVE /Y rigkey.pem "%D%..\ssl\selfsigned.key" > NUL
-MOVE /Y localhostcert.pem "%D%..\..\my-extension\conf\server.crt" > NUL
-MOVE /Y localhostkey.pem  "%D%..\..\my-extension\conf\server.key" > NUL
+REM Move all desired files to the rig ssl directory.
+MOVE /Y cacert.pem "%SSL%\cacert.crt" > NUL
+MOVE /Y cakey.pem "%SSL%\cacert.key" > NUL
+MOVE /Y rigcert.pem "%SSL%\selfsigned.crt" > NUL
+MOVE /Y rigkey.pem "%SSL%\selfsigned.key" > NUL
+MOVE /Y localhostcert.pem "%SSL%\server.crt" > NUL
+MOVE /Y localhostkey.pem "%SSL%\server.key" > NUL
 IF ERRORLEVEL 1 (
-	ECHO Cannot place the extension server certificates.
-	GOTO done
+	ECHO Cannot place the developer rig certificates.
+	EXIT /B 1
 )
-
-REM Import the CA certificate into the local machine's root certificate store.
-ECHO Import-Certificate -Filepath "%D%..\ssl\cacert.crt" -CertStoreLocation Cert:\LocalMachine\Root > import.ps1
-powershell -File import.ps1
-IF ERRORLEVEL 1 (
-	ECHO Cannot import the CA certificate into the local machine's root certificate store.
-	GOTO done
-)
-
-REM If Firefox is installed, allow it to use the certificates in the local machine's root certificate store.
-SET FF=%ProgramFiles%\Mozilla Firefox\defaults\pref
-IF EXIST "%FF%" (
-	ECHO pref^("security.enterprise_roots.enabled", true^); > "%FF%\twitch-developer-rig.js"
-)
-
-:done
-SET EXIT_CODE=%ERRORLEVEL%
-CD /D %D%
-RD /Q /S "%T%"
-%PAUSE%
-EXIT /B %EXIT_CODE%
